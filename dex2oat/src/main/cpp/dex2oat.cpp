@@ -134,42 +134,9 @@ int main(int argc, char **argv) {
     read_int(sock_fd);  // Sync
     close(sock_fd);
 
-    // 2. Get liboat_hook.so FD
-    sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (connect(sock_fd, reinterpret_cast<struct sockaddr *>(&sock), len)) {
-        PLOGE("failed to connect to %s", sock.sun_path + 1);
-        return 1;
-    }
-
-    write_int(sock_fd, LP_SELECT(4, 5));
-    int hooker_fd = recv_fd(sock_fd);
-    read_int(sock_fd);  // Sync
-    close(sock_fd);
-
-    if (hooker_fd == -1) {
-        LOGE("failed to read liboat_hook.so");
-    } else {
-        int mem_fd = syscall(__NR_memfd_create, "liboat_hook_memfd", 0);
-        if (mem_fd >= 0) {
-            // Get the exact size of the original library
-            LOGD("Copying %d as mem_fd %d", hooker_fd, mem_fd);
-            struct stat st;
-            if (fstat(hooker_fd, &st) == 0) {
-                // Tell the kernel to copy the entire file directly to the memfd
-                off_t offset = 0;
-                sendfile(mem_fd, hooker_fd, &offset, st.st_size);
-
-                // Swap the old FD with the new memfd
-                close(hooker_fd);
-                hooker_fd = mem_fd;
-            } else {
-                PLOGE("fstat failed");
-                close(mem_fd);
-            }
-        } else {
-            PLOGE("memfd_create failed, falling back to original fd");
-        }
-    }
+    // Diagnostic mode: deliberately skip liboat_hook.so and LD_PRELOAD.
+    // This isolates ART's dex2oat execution from the LSPlt/OAT-header hook,
+    // while keeping NoMount redirection and the Vector wrapper active.
 
     LOGD("sock: %s stock_fd: %d", sock.sun_path + 1, stock_fd);
 
@@ -196,20 +163,10 @@ int main(int argc, char **argv) {
     exec_argv.push_back("--inline-max-code-units=0");
     exec_argv.push_back(nullptr);
 
-    // Setup Environment variables
-    // Clear LD_LIBRARY_PATH to let the linker use internal config
+    // Setup environment. No LD_PRELOAD is set in this diagnostic build.
+    // Clear inherited values so a parent process cannot inject another hook.
     unsetenv("LD_LIBRARY_PATH");
-
-    // Set LD_PRELOAD to point to the hooker library FD
-    std::string preload_val = "LD_PRELOAD=/proc/self/fd/" + std::to_string(hooker_fd);
-    LOGD("Inject oat hook via %s", preload_val.data());
-    setenv("LD_PRELOAD", ("/proc/self/fd/" + std::to_string(hooker_fd)).c_str(), 1);
-
-    // Pass original argv[0] as DEX2OAT_CMD
-    if (argv[0]) {
-        setenv("DEX2OAT_CMD", argv[0], 1);
-        LOGD("DEX2OAT_CMD set to %s", argv[0]);
-    }
+    unsetenv("LD_PRELOAD");
 
     LOGI("Executing via linker: %s executing %s", linker_path, stock_fd_path);
 

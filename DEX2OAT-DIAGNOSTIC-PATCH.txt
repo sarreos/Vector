@@ -1,0 +1,24 @@
+Vector NoMount — dex2oat hook-isolation diagnostic build
+
+Change
+------
+The dex2oat wrapper no longer requests liboat_hook.so from the daemon and
+executes the stock ART compiler without LD_PRELOAD. NoMount redirection and
+the Vector dex2oat wrapper remain enabled. The existing
+--inline-max-code-units=0 argument is retained.
+
+Purpose
+-------
+This is a diagnostic build to test whether liboat_hook.so / LSPlt startup
+is responsible for the dex2oat SIGSEGV and contemporaneous SELinux execmem
+denial. It is not a complete fix: OAT metadata spoofing is disabled in this
+build, so generated OAT/VDEX metadata may differ from a normal Vector build.
+
+Interpretation
+--------------
+* If forced dexopt succeeds: investigate liboat_hook.so, LSPlt hook setup,
+  and its executable-memory requirements.
+* If it still fails with the same execmem AVC/SIGSEGV: the hook constructor
+  is less likely; investigate ART/compiler execution and SELinux policy.
+
+Only source changed: dex2oat/src/main/cpp/dex2oat.cpp. No build was performed.
