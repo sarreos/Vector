@@ -4,7 +4,6 @@ import android.net.LocalServerSocket
 import android.os.Build
 import android.os.FileObserver
 import android.os.SELinux
-import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
 import android.util.Log
@@ -38,14 +37,6 @@ object Dex2OatServer {
   @Volatile
   var compatibility = DEX2OAT_OK
     private set
-
-  private external fun doMountNative(
-      enabled: Boolean,
-      r32: String?,
-      d32: String?,
-      r64: String?,
-      d64: String?
-  )
 
   private external fun setSockCreateContext(context: String?): Boolean
 
@@ -100,21 +91,20 @@ object Dex2OatServer {
 
       when {
         !enforcing -> {
-          if (compatibility == DEX2OAT_OK) doMount(false)
+          if (compatibility == DEX2OAT_OK) setRedirections(false)
           compatibility = DEX2OAT_SELINUX_PERMISSIVE
         }
         hasSePolicyErrors() -> {
-          if (compatibility == DEX2OAT_OK) doMount(false)
+          if (compatibility == DEX2OAT_OK) setRedirections(false)
           compatibility = DEX2OAT_SEPOLICY_INCORRECT
         }
         compatibility != DEX2OAT_OK -> {
-          doMount(true)
-          if (notMounted()) {
-            doMount(false)
+          if (setRedirections(true)) {
+            compatibility = DEX2OAT_OK
+          } else {
+            setRedirections(false)
             compatibility = DEX2OAT_MOUNT_FAILED
             SelinuxObserver.stopWatching()
-          } else {
-            compatibility = DEX2OAT_OK
           }
         }
       }
@@ -189,38 +179,139 @@ object Dex2OatServer {
         .onFailure { dex2oatArray[dex2oatArray.indexOf(path)] = null }
   }
 
-  private fun notMounted(): Boolean {
-    for (i in 0 until 4) {
-      val bin = dex2oatArray[i] ?: continue
-      try {
-        val apex = Os.stat("/proc/1/root$bin")
-        val wrapper = Os.stat(if (i < 2) WRAPPER32 else WRAPPER64)
-        if (apex.st_dev != wrapper.st_dev || apex.st_ino != wrapper.st_ino) {
-          return true
-        }
-      } catch (e: ErrnoException) {
-        return true
-      }
-    }
-    return false
+  /**
+   * NoMount's CLI is installed by its metamodule. Prefer the module-local symlink so this
+   * works with both KernelSU and APatch without depending on their manager-specific paths.
+   */
+  private fun noMountBinary(): String? {
+    val candidates =
+        listOf(
+            "/data/adb/modules/nomount/bin/nm",
+            "/data/adb/ksu/bin/nm",
+            "/data/adb/ap/bin/nm")
+    return candidates.firstOrNull { File(it).isFile && File(it).canExecute() }
   }
 
-  private fun doMount(enabled: Boolean) {
-    doMountNative(enabled, dex2oatArray[0], dex2oatArray[1], dex2oatArray[2], dex2oatArray[3])
+  private fun runNoMount(vararg args: String): Boolean {
+    val binary = noMountBinary()
+    if (binary == null) {
+      Log.e(TAG, "NoMount CLI not found; install and enable the NoMount metamodule")
+      return false
+    }
+
+    return runCatching {
+          val process =
+              ProcessBuilder(listOf(binary) + args)
+                  .redirectErrorStream(true)
+                  .start()
+          val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+          val exitCode = process.waitFor()
+          if (output.isNotEmpty()) Log.d(TAG, "nm ${args.joinToString(" ")}: $output")
+          if (exitCode != 0) {
+            Log.e(TAG, "nm ${args.joinToString(" ")} failed with exit code $exitCode")
+          }
+          exitCode == 0
+        }
+        .onFailure { Log.e(TAG, "Failed to execute NoMount", it) }
+        .getOrDefault(false)
+  }
+
+  private fun setDex2OatFallback(enabled: Boolean) {
+    val args =
+        if (enabled) {
+          listOf("resetprop", "dalvik.vm.dex2oat-flags", "--inline-max-code-units=0")
+        } else {
+          listOf("resetprop", "--delete", "dalvik.vm.dex2oat-flags")
+        }
+
+    runCatching {
+          val process = ProcessBuilder(args).redirectErrorStream(true).start()
+          val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+          val exitCode = process.waitFor()
+          if (output.isNotEmpty()) Log.d(TAG, "resetprop: $output")
+          if (exitCode != 0) Log.e(TAG, "resetprop failed with exit code $exitCode")
+        }
+        .onFailure { Log.e(TAG, "Failed to update dex2oat fallback property", it) }
+  }
+
+  /**
+   * Redirect every discovered ART compiler entry point to the matching Vector wrapper.
+   *
+   * Re-adding an existing NoMount rule updates its target, so this is safe to call after
+   * daemon restarts and when SELinux policy changes.
+   */
+  private fun setRedirections(enabled: Boolean): Boolean {
+    val targets = (0 until 4).mapNotNull { dex2oatArray[it] }.distinct()
+
+    if (!enabled) {
+      var success = true
+      for (i in 0 until 4) {
+        val target = dex2oatArray[i] ?: continue
+        if (!runNoMount("rule", "del", target)) success = false
+      }
+      setDex2OatFallback(true)
+      return success
+    }
+
+    if (targets.isEmpty()) {
+      Log.e(TAG, "No stock dex2oat binaries were discovered")
+      setDex2OatFallback(true)
+      return false
+    }
+
+    val wrapperPaths = arrayOfNulls<String>(2)
+    for (i in 0 until 4) {
+      if (dex2oatArray[i] == null) continue
+      val arch = if (i < 2) 0 else 1
+      if (wrapperPaths[arch] == null) {
+        val relativePath = if (arch == 0) WRAPPER32 else WRAPPER64
+        val wrapper =
+            runCatching { File(relativePath).canonicalPath }.getOrNull()
+        if (wrapper == null || !File(wrapper).isFile || !File(wrapper).canExecute()) {
+          Log.e(TAG, "Vector dex2oat wrapper is missing or not executable: $relativePath")
+          setDex2OatFallback(true)
+          return false
+        }
+        wrapperPaths[arch] = wrapper
+      }
+    }
+
+    // Check that the NoMount userspace/kernel interface is alive before installing rules.
+    if (!runNoMount("version")) {
+      setDex2OatFallback(true)
+      return false
+    }
+
+    for (i in 0 until 4) {
+      val target = dex2oatArray[i] ?: continue
+      val wrapper = wrapperPaths[if (i < 2) 0 else 1]!!
+      if (!runNoMount("rule", "add", target, wrapper)) {
+        Log.e(TAG, "Failed to redirect $target to $wrapper")
+        // Roll back partial installation rather than leaving only some compiler paths wrapped.
+        for (rollback in 0 until 4) {
+          dex2oatArray[rollback]?.let { runNoMount("rule", "del", it) }
+        }
+        setDex2OatFallback(true)
+        return false
+      }
+    }
+
+    setDex2OatFallback(false)
+    return true
   }
 
   fun start() {
-    if (notMounted()) {
-      doMount(true)
-      if (notMounted()) {
-        doMount(false)
-        compatibility = DEX2OAT_MOUNT_FAILED
-        return
-      }
+    if (!setRedirections(true)) {
+      setRedirections(false)
+      compatibility = DEX2OAT_MOUNT_FAILED
+      return
     }
 
     SelinuxObserver.startWatching()
     onSelinuxEvent()
+
+    // A permissive or incompatible SELinux policy disables the wrapper in onSelinuxEvent().
+    if (compatibility != DEX2OAT_OK) return
 
     // Run the socket accept loop in an IO coroutine
     VectorDaemon.scope.launch { runSocketLoop() }
@@ -272,7 +363,7 @@ object Dex2OatServer {
         .onFailure {
           Log.e(TAG, "Dex2oat wrapper daemon crashed", it)
           if (compatibility == DEX2OAT_OK) {
-            doMount(false)
+            setRedirections(false)
             compatibility = DEX2OAT_CRASHED
           }
         }
