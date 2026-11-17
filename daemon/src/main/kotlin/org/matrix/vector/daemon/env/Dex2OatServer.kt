@@ -301,20 +301,44 @@ object Dex2OatServer {
   }
 
   fun start() {
-    if (!setRedirections(true)) {
-      setRedirections(false)
-      compatibility = DEX2OAT_MOUNT_FAILED
-      return
-    }
-
-    SelinuxObserver.startWatching()
-    onSelinuxEvent()
-
-    // A permissive or incompatible SELinux policy disables the wrapper in onSelinuxEvent().
-    if (compatibility != DEX2OAT_OK) return
-
-    // Run the socket accept loop in an IO coroutine
+    // The socket and all SELinux labels must be ready before a redirected dex2oat
+    // executable can be reached. runSocketLoop() prepares them before installing rules.
     VectorDaemon.scope.launch { runSocketLoop() }
+  }
+
+  /** Apply and verify labels before exposing the wrapper through NoMount. */
+  private fun prepareFileContexts(): Boolean {
+    val dex2oatExec = "u:object_r:dex2oat_exec:s0"
+    val xposedFile = "u:object_r:xposed_file:s0"
+    val wrapperContext =
+        if (SELinux.checkSELinuxAccess(
+            "u:r:dex2oat:s0", dex2oatExec, "file", "execute_no_trans")) {
+          dex2oatExec
+        } else {
+          xposedFile
+        }
+
+    val files =
+        listOf(
+            WRAPPER32 to wrapperContext,
+            WRAPPER64 to wrapperContext,
+            HOOKER32 to xposedFile,
+            HOOKER64 to xposedFile)
+
+    var success = true
+    for ((path, context) in files) {
+      val absolutePath = runCatching { File(path).canonicalPath }.getOrNull()
+      if (absolutePath == null || !File(absolutePath).isFile) {
+        Log.e(TAG, "Cannot resolve wrapper resource: $path")
+        success = false
+        continue
+      }
+      if (!SELinux.setFileContext(absolutePath, context)) {
+        Log.e(TAG, "Failed to set SELinux context $context on $absolutePath")
+        success = false
+      }
+    }
+    return success
   }
 
   private fun runSocketLoop() {
@@ -322,50 +346,61 @@ object Dex2OatServer {
     val sockPath = getSockPath()
     Log.d(TAG, "wrapper path: $sockPath")
 
-    val xposedFile = "u:object_r:xposed_file:s0"
-    val dex2oatExec = "u:object_r:dex2oat_exec:s0"
-
-    if (SELinux.checkSELinuxAccess("u:r:dex2oat:s0", dex2oatExec, "file", "execute_no_trans")) {
-      SELinux.setFileContext(WRAPPER32, dex2oatExec)
-      SELinux.setFileContext(WRAPPER64, dex2oatExec)
-      setSockCreateContext("u:r:dex2oat:s0")
-    } else {
-      SELinux.setFileContext(WRAPPER32, xposedFile)
-      SELinux.setFileContext(WRAPPER64, xposedFile)
-      setSockCreateContext("u:r:installd:s0")
-    }
-    SELinux.setFileContext(HOOKER32, xposedFile)
-    SELinux.setFileContext(HOOKER64, xposedFile)
-
     runCatching {
-          // Closed by hand rather than with `use`: LocalServerSocket only implements Closeable
-          // from API 28, and this daemon runs from 27. The client socket below has implemented it
-          // since 17, so that one keeps `use`.
-          val server = LocalServerSocket(sockPath)
-          try {
-            setSockCreateContext(null)
-            while (true) {
-              // This blocks until the C++ wrapper connects
-              server.accept().use { client ->
-                val input = client.inputStream
-                val output = client.outputStream
-                val id = input.read()
-                if (id in fdArray.indices && fdArray[id] != null) {
-                  client.setFileDescriptorsForSend(arrayOf(fdArray[id]!!))
-                  output.write(1)
-                }
-              }
+      check(prepareFileContexts()) { "Failed to prepare dex2oat wrapper SELinux contexts" }
+
+      val socketContext =
+          if (SELinux.checkSELinuxAccess(
+              "u:r:dex2oat:s0", "u:object_r:dex2oat_exec:s0", "file", "execute_no_trans")) {
+            "u:r:dex2oat:s0"
+          } else {
+            "u:r:installd:s0"
+          }
+
+      check(setSockCreateContext(socketContext)) {
+        "Failed to set socket creation context $socketContext"
+      }
+
+      // Create the socket before installing any redirection rules, so the wrapper
+      // cannot be invoked during a window in which its server endpoint is absent.
+      val server = LocalServerSocket(sockPath)
+      try {
+        check(setSockCreateContext(null)) { "Failed to clear socket creation context" }
+
+        SelinuxObserver.startWatching()
+        onSelinuxEvent()
+
+        // A permissive or incompatible policy leaves the wrapper disabled. The
+        // observer can re-enable it later after SELinux state changes.
+        if (compatibility == DEX2OAT_OK && !setRedirections(true)) {
+          setRedirections(false)
+          compatibility = DEX2OAT_MOUNT_FAILED
+          SelinuxObserver.stopWatching()
+        }
+
+        while (true) {
+          // This blocks until the C++ wrapper connects.
+          server.accept().use { client ->
+            val input = client.inputStream
+            val output = client.outputStream
+            val id = input.read()
+            if (id in fdArray.indices && fdArray[id] != null) {
+              client.setFileDescriptorsForSend(arrayOf(fdArray[id]!!))
+              output.write(1)
             }
-          } finally {
-            server.close()
           }
         }
-        .onFailure {
-          Log.e(TAG, "Dex2oat wrapper daemon crashed", it)
-          if (compatibility == DEX2OAT_OK) {
-            setRedirections(false)
-            compatibility = DEX2OAT_CRASHED
-          }
-        }
+      } finally {
+        server.close()
+      }
+    }.onFailure {
+      Log.e(TAG, "Dex2oat wrapper daemon initialization/accept loop failed", it)
+      setSockCreateContext(null)
+      if (compatibility == DEX2OAT_OK) {
+        setRedirections(false)
+        compatibility = DEX2OAT_MOUNT_FAILED
+      }
+      SelinuxObserver.stopWatching()
+    }
   }
 }
